@@ -1,0 +1,44 @@
+name: Update system & check Skirk logs
+
+on:
+  workflow_dispatch:   # run manually from Actions tab
+
+jobs:
+  update-and-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: System update + Skirk update + logs
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || '22' }}
+          timeout: 10m
+          command_timeout: 10m
+          script: |
+            set -e
+            echo "=== 1. System update ==="
+            sudo apt update && sudo apt upgrade -y
+
+            echo ""
+            echo "=== 2. Update Skirk to latest release ==="
+            curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | SKIRK_SERVER_SETUP=1 sh
+            export PATH="$HOME/.local/bin:$PATH"
+            skirk version
+
+            echo ""
+            echo "=== 3. Skirk service status ==="
+            sudo systemctl status skirk-exit --no-pager -l || echo "Service not found"
+
+            echo ""
+            echo "=== 4. Recent Skirk logs (last 2 hours) ==="
+            sudo journalctl -u skirk-exit --since "2 hours ago" --no-pager -l || echo "No journal entries"
+
+            echo ""
+            echo "=== 5. System resource overview ==="
+            free -h
+            df -h /
+            echo ""
+            echo "Top 5 CPU processes:"
+            ps aux --sort=-%cpu | head -n 6
