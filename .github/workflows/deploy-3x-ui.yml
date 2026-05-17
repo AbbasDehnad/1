@@ -1,0 +1,61 @@
+name: Deploy 3x-ui Panel to VPS
+
+on:
+  workflow_dispatch:   # manual trigger from Actions tab
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install 3x-ui on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || '22' }}
+          timeout: 10m
+          command_timeout: 10m
+          script: |
+            set -e
+
+            echo "=== Installing 3x-ui Panel ==="
+            echo ">>> This may take a few minutes to download and install."
+            echo ""
+
+            # The official one-line installer (must run as root)
+            bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+
+            echo ""
+            echo "=== ✅ 3x-ui panel installed successfully ==="
+            echo ""
+            echo "To manage the panel, run: x-ui"
+            echo ""
+            # Display the current settings
+            x-ui settings
+
+      - name: Show access info
+        if: success()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || '22' }}
+          timeout: 30s
+          command_timeout: 30s
+          script: |
+            echo "=========================================="
+            echo "3x-ui PANEL ACCESS INFO"
+            echo "=========================================="
+            echo ""
+            echo "Panel settings:"
+            /usr/local/x-ui/x-ui settings
+            echo ""
+            # Get server public IP
+            SERVER_IP=$(curl -s -4 ifconfig.me || curl -s ipinfo.io/ip)
+            PORT=$(/usr/local/x-ui/x-ui settings | grep -oP 'port: \K\d+')
+            WEB_PATH=$(/usr/local/x-ui/x-ui settings | grep -oP 'webBasePath: \K\S+')
+            echo ""
+            echo "Access URL: http://${SERVER_IP}:${PORT}${WEB_PATH}"
+            echo "=========================================="
