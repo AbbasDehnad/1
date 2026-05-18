@@ -1,7 +1,7 @@
 name: Deploy Skirk Exit with personal OAuth
 
 on:
-  workflow_dispatch:   # manual trigger
+  workflow_dispatch:
 
 jobs:
   setup:
@@ -18,30 +18,23 @@ jobs:
           command_timeout: 30m
           script: |
             set -e
-
             echo "=== Installing Skirk ==="
             curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | SKIRK_SERVER_SETUP=1 sh
             export PATH="$HOME/.local/bin:$PATH"
-
             echo "=== Removing old kit ==="
             rm -rf skirk-kit
-
             echo ""
             echo "=== Starting interactive OAuth (personal client) ==="
-            echo ">>> You'll need to authorize in the browser as before."
-            echo ""
-
             skirk setup init \
               --out skirk-kit \
               --reset-google-login \
               --oauth-mode personal \
               --google-client-id "$GOOGLE_CLIENT_ID" \
               --google-client-secret "$GOOGLE_CLIENT_SECRET"
-
             echo ""
-            echo "=== ✅ Setup completed ==="
+            echo "=== Setup completed ==="
             echo "CLIENT PROFILE:"
             cat skirk-kit/client.skirk
-          env:
-            GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-            GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
