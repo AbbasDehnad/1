@@ -1,7 +1,10 @@
 name: Create VLESS + TLS inbound
 
 on:
-  workflow_dispatch:   # manual trigger
+  push:
+      branches:
+        - main
+  workflow_dispatch:
 
 jobs:
   create-inbound:
@@ -20,13 +23,13 @@ jobs:
             set -e
             export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:$PATH"
 
-            # Ensure jq is installed
+            # Install jq if missing
             if ! command -v jq &>/dev/null; then
               echo ">>> Installing jq..."
               sudo apt update -qq && sudo apt install -y -qq jq
             fi
 
-            # --- 1. Get panel connection details ---
+            # --- 1. Get panel connection info ---
             echo "=== Getting panel connection info ==="
             PANEL_INFO=$(x-ui settings)
             PANEL_PORT=$(echo "$PANEL_INFO" | grep -oP 'port: \K\d+')
@@ -34,29 +37,46 @@ jobs:
             BASE_URL="http://127.0.0.1:${PANEL_PORT}${WEB_BASE}"
             echo "Panel URL: $BASE_URL"
 
-            # --- 2. Login (JSON payload required) ---
+            # --- 2. Login with verbose output ---
             echo "=== Logging into 3x-ui panel ==="
             LOGIN_JSON=$(jq -n \
               --arg u "$USER_3XUI" \
               --arg p "$PASS_3XUI" \
               '{username: $u, password: $p}')
+            echo "Sending login request..."
 
-            LOGIN_RESP=$(curl -s -c /tmp/cookie.txt -X POST "${BASE_URL}/login" \
+            # Capture HTTP status and body
+            LOGIN_RESPONSE=$(curl -s -w "\n%{http_code}" -c /tmp/cookie.txt -X POST "${BASE_URL}/login" \
               -H "Content-Type: application/json" \
               --data-binary "$LOGIN_JSON")
 
-            # Debug output (remove or comment in production if sensitive)
-            echo "Login response: $LOGIN_RESP"
+            # Split body and status code
+            HTTP_BODY=$(echo "$LOGIN_RESPONSE" | sed '$d')
+            HTTP_CODE=$(echo "$LOGIN_RESPONSE" | tail -n1)
 
-            if ! echo "$LOGIN_RESP" | jq -e '.success' &>/dev/null; then
-              echo "❌ Login failed: $LOGIN_RESP"
+            echo "HTTP Status: $HTTP_CODE"
+            echo "Response body:"
+            echo "$HTTP_BODY"
+
+            # Check for success (several possible indicators)
+            SUCCESS=false
+            if echo "$HTTP_BODY" | jq -e '.success == true' &>/dev/null; then
+              SUCCESS=true
+            elif [ "$HTTP_CODE" = "200" ] && [ -s /tmp/cookie.txt ]; then
+              # Some versions set a cookie on successful login without explicit JSON flag
+              SUCCESS=true
+            elif echo "$HTTP_BODY" | grep -q "login success"; then
+              SUCCESS=true
+            fi
+
+            if [ "$SUCCESS" = false ]; then
+              echo "❌ Login failed. Check your credentials or panel API version."
               exit 1
             fi
             echo "✔ Logged in successfully."
 
-            # --- 3. Ensure port 80 is reachable for ACME ---
-            echo "=== Checking port 80 accessibility ==="
-            # Temporarily allow HTTP if ufw is active
+            # --- 3. Ensure port 80 is open for ACME ---
+            echo "=== Checking port 80 ==="
             if command -v ufw &>/dev/null && sudo ufw status | grep -qw active; then
               if ! sudo ufw status | grep -q "80/tcp.*ALLOW"; then
                 echo ">>> Allowing port 80/tcp temporarily..."
@@ -64,9 +84,9 @@ jobs:
               fi
             fi
 
-            # --- 4. Obtain Let's Encrypt certificate ---
+            # --- 4. Request certificate ---
             DOMAIN="aparat.coursevideo.ir"
-            EMAIL="admin@${DOMAIN}"   # change if you want a different email
+            EMAIL="admin@${DOMAIN}"
 
             echo "=== Requesting certificate for $DOMAIN ==="
             CERT_RESP=$(curl -s -b /tmp/cookie.txt -X POST "${BASE_URL}/panel/api/inbounds/generateCert" \
@@ -82,10 +102,10 @@ jobs:
             fi
             echo "✔ Certificate saved: cert=$CERT_FILE key=$KEY_FILE"
 
-            # --- 5. Choose a free port ---
+            # --- 5. Choose port ---
             DESIRED_PORT=443
             if ss -tlnp | grep -q ":$DESIRED_PORT "; then
-              echo "Port $DESIRED_PORT is already in use, falling back to 8443."
+              echo "Port $DESIRED_PORT in use, falling back to 8443."
               INBOUND_PORT=8443
             else
               INBOUND_PORT=$DESIRED_PORT
@@ -94,7 +114,6 @@ jobs:
             # --- 6. Create VLESS inbound ---
             CLIENT_UUID=$(cat /proc/sys/kernel/random/uuid)
             echo "=== Creating inbound on port $INBOUND_PORT ==="
-
             PAYLOAD=$(jq -n \
               --arg port "$INBOUND_PORT" \
               --arg uuid "$CLIENT_UUID" \
@@ -120,7 +139,6 @@ jobs:
               -H "Content-Type: application/json" \
               -d "$PAYLOAD")
             echo "Add inbound response: $ADD_RESP"
-
             INBOUND_ID=$(echo "$ADD_RESP" | jq -r '.data.id')
             if [ "$INBOUND_ID" = "null" ] || [ -z "$INBOUND_ID" ]; then
               echo "❌ Failed to create inbound."
@@ -128,11 +146,10 @@ jobs:
             fi
             echo "✔ Inbound created with id=$INBOUND_ID"
 
-            # --- 7. Retrieve share link ---
+            # --- 7. Get share link ---
             SHARE_RESP=$(curl -s -b /tmp/cookie.txt "${BASE_URL}/panel/api/inbounds/share/${INBOUND_ID}")
             VLESS_LINK=$(echo "$SHARE_RESP" | jq -r '.data')
             if [ "$VLESS_LINK" = "null" ] || [ -z "$VLESS_LINK" ]; then
-              # fallback: construct manually
               VLESS_LINK="vless://${CLIENT_UUID}@${DOMAIN}:${INBOUND_PORT}?type=tcp&security=tls&sni=${DOMAIN}#${DOMAIN}"
             fi
 
@@ -142,7 +159,6 @@ jobs:
             echo "$VLESS_LINK"
             echo "=========================================="
 
-            # Cleanup
             rm -f /tmp/cookie.txt
         env:
           USER_3XUI: ${{ secrets.USER_3XUI }}
