@@ -34,34 +34,55 @@ jobs:
             BASE_URL="http://127.0.0.1:${PANEL_PORT}${WEB_BASE}"
             echo "Panel URL: $BASE_URL"
 
-            # --- 2. Login ---
+            # --- 2. Login (JSON payload required) ---
             echo "=== Logging into 3x-ui panel ==="
+            LOGIN_JSON=$(jq -n \
+              --arg u "$USER_3XUI" \
+              --arg p "$PASS_3XUI" \
+              '{username: $u, password: $p}')
+
             LOGIN_RESP=$(curl -s -c /tmp/cookie.txt -X POST "${BASE_URL}/login" \
-              -d "username=${USER_3XUI}&password=${PASS_3XUI}")
+              -H "Content-Type: application/json" \
+              --data-binary "$LOGIN_JSON")
+
+            # Debug output (remove or comment in production if sensitive)
+            echo "Login response: $LOGIN_RESP"
+
             if ! echo "$LOGIN_RESP" | jq -e '.success' &>/dev/null; then
-              echo "Login failed: $LOGIN_RESP"
+              echo "❌ Login failed: $LOGIN_RESP"
               exit 1
             fi
-            echo "Logged in successfully."
+            echo "✔ Logged in successfully."
 
-            # --- 3. Obtain Let's Encrypt certificate ---
+            # --- 3. Ensure port 80 is reachable for ACME ---
+            echo "=== Checking port 80 accessibility ==="
+            # Temporarily allow HTTP if ufw is active
+            if command -v ufw &>/dev/null && sudo ufw status | grep -qw active; then
+              if ! sudo ufw status | grep -q "80/tcp.*ALLOW"; then
+                echo ">>> Allowing port 80/tcp temporarily..."
+                sudo ufw allow 80/tcp
+              fi
+            fi
+
+            # --- 4. Obtain Let's Encrypt certificate ---
             DOMAIN="aparat.coursevideo.ir"
-            EMAIL="admin@${DOMAIN}"   # change if needed
+            EMAIL="admin@${DOMAIN}"   # change if you want a different email
 
             echo "=== Requesting certificate for $DOMAIN ==="
             CERT_RESP=$(curl -s -b /tmp/cookie.txt -X POST "${BASE_URL}/panel/api/inbounds/generateCert" \
               -H "Content-Type: application/json" \
               -d "{\"domains\":[\"$DOMAIN\"],\"email\":\"$EMAIL\"}")
             echo "Certificate response: $CERT_RESP"
+
             CERT_FILE=$(echo "$CERT_RESP" | jq -r '.data.certFile')
             KEY_FILE=$(echo "$CERT_RESP" | jq -r '.data.keyFile')
             if [ "$CERT_FILE" = "null" ] || [ -z "$CERT_FILE" ]; then
-              echo "Certificate generation failed. Ensure domain $DOMAIN points to this VPS and port 80 is reachable for HTTP challenge."
+              echo "❌ Certificate generation failed. Ensure domain $DOMAIN points to this VPS and port 80 is open."
               exit 1
             fi
-            echo "Certificate saved: cert=$CERT_FILE key=$KEY_FILE"
+            echo "✔ Certificate saved: cert=$CERT_FILE key=$KEY_FILE"
 
-            # --- 4. Choose a free port ---
+            # --- 5. Choose a free port ---
             DESIRED_PORT=443
             if ss -tlnp | grep -q ":$DESIRED_PORT "; then
               echo "Port $DESIRED_PORT is already in use, falling back to 8443."
@@ -70,7 +91,7 @@ jobs:
               INBOUND_PORT=$DESIRED_PORT
             fi
 
-            # --- 5. Create VLESS inbound ---
+            # --- 6. Create VLESS inbound ---
             CLIENT_UUID=$(cat /proc/sys/kernel/random/uuid)
             echo "=== Creating inbound on port $INBOUND_PORT ==="
 
@@ -99,14 +120,15 @@ jobs:
               -H "Content-Type: application/json" \
               -d "$PAYLOAD")
             echo "Add inbound response: $ADD_RESP"
+
             INBOUND_ID=$(echo "$ADD_RESP" | jq -r '.data.id')
             if [ "$INBOUND_ID" = "null" ] || [ -z "$INBOUND_ID" ]; then
-              echo "Failed to create inbound."
+              echo "❌ Failed to create inbound."
               exit 1
             fi
-            echo "Inbound created with id=$INBOUND_ID"
+            echo "✔ Inbound created with id=$INBOUND_ID"
 
-            # --- 6. Retrieve share link ---
+            # --- 7. Retrieve share link ---
             SHARE_RESP=$(curl -s -b /tmp/cookie.txt "${BASE_URL}/panel/api/inbounds/share/${INBOUND_ID}")
             VLESS_LINK=$(echo "$SHARE_RESP" | jq -r '.data')
             if [ "$VLESS_LINK" = "null" ] || [ -z "$VLESS_LINK" ]; then
