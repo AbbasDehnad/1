@@ -20,15 +20,15 @@ jobs:
           timeout: 10m
           command_timeout: 10m
           script: |
-            set -e
+            set +e   # disable exit-on-error so we can debug properly
             export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:$PATH"
-
-            # Install jq if missing
+          
+            # Ensure jq is installed
             if ! command -v jq &>/dev/null; then
               echo ">>> Installing jq..."
               sudo apt update -qq && sudo apt install -y -qq jq
             fi
-
+          
             # --- 1. Get panel connection info ---
             echo "=== Getting panel connection info ==="
             PANEL_INFO=$(x-ui settings)
@@ -36,72 +36,85 @@ jobs:
             WEB_BASE=$(echo "$PANEL_INFO" | grep -oP 'webBasePath: \K\S+')
             BASE_URL="http://127.0.0.1:${PANEL_PORT}${WEB_BASE}"
             echo "Panel URL: $BASE_URL"
-
-            # --- 2. Login with verbose output ---
+          
+            # --- 2. Login with full error output ---
             echo "=== Logging into 3x-ui panel ==="
             LOGIN_JSON=$(jq -n \
               --arg u "$USER_3XUI" \
               --arg p "$PASS_3XUI" \
               '{username: $u, password: $p}')
             echo "Sending login request..."
-
-            # Capture HTTP status and body
-            LOGIN_RESPONSE=$(curl -s -w "\n%{http_code}" -c /tmp/cookie.txt -X POST "${BASE_URL}/login" \
+          
+            # Use a temporary file for response to capture all output
+            RESPONSE_TMP=$(mktemp)
+            COOKIE_TMP="/tmp/cookie.txt"
+            rm -f "$COOKIE_TMP"
+          
+            # Run curl, capture exit code and all output
+            CURL_EXIT=0
+            curl -v -w "\n%{http_code}" -o "$RESPONSE_TMP" -c "$COOKIE_TMP" \
+              -X POST "${BASE_URL}/login" \
               -H "Content-Type: application/json" \
-              --data-binary "$LOGIN_JSON")
-
-            # Split body and status code
-            HTTP_BODY=$(echo "$LOGIN_RESPONSE" | sed '$d')
-            HTTP_CODE=$(echo "$LOGIN_RESPONSE" | tail -n1)
-
+              --data-binary "$LOGIN_JSON" 2>&1 | tee /tmp/curl_stderr.txt
+            CURL_EXIT=${PIPESTATUS[0]}
+          
+            HTTP_CODE=$(tail -n1 "$RESPONSE_TMP")
+            RESPONSE_BODY=$(head -n -1 "$RESPONSE_TMP")
+          
+            echo "Curl exit code: $CURL_EXIT"
+            echo "Curl verbose output (last 20 lines):"
+            tail -20 /tmp/curl_stderr.txt
+            echo ""
             echo "HTTP Status: $HTTP_CODE"
             echo "Response body:"
-            echo "$HTTP_BODY"
-
-            # Check for success (several possible indicators)
+            echo "$RESPONSE_BODY"
+          
+            if [ $CURL_EXIT -ne 0 ]; then
+              echo "❌ Curl failed to connect. Check if the panel is running and the URL is correct."
+              exit 1
+            fi
+          
+            # Check for success (multiple indicators)
             SUCCESS=false
-            if echo "$HTTP_BODY" | jq -e '.success == true' &>/dev/null; then
+            if echo "$RESPONSE_BODY" | jq -e '.success == true' &>/dev/null; then
               SUCCESS=true
-            elif [ "$HTTP_CODE" = "200" ] && [ -s /tmp/cookie.txt ]; then
-              # Some versions set a cookie on successful login without explicit JSON flag
+            elif [ "$HTTP_CODE" = "200" ] && [ -s "$COOKIE_TMP" ]; then
               SUCCESS=true
-            elif echo "$HTTP_BODY" | grep -q "login success"; then
+            elif echo "$RESPONSE_BODY" | grep -qi "success"; then
               SUCCESS=true
             fi
-
+          
             if [ "$SUCCESS" = false ]; then
-              echo "❌ Login failed. Check your credentials or panel API version."
+              echo "❌ Login failed. Check credentials or panel version."
               exit 1
             fi
             echo "✔ Logged in successfully."
-
-            # --- 3. Ensure port 80 is open for ACME ---
+          
+            # --- 3. Ensure port 80 is open ---
             echo "=== Checking port 80 ==="
             if command -v ufw &>/dev/null && sudo ufw status | grep -qw active; then
               if ! sudo ufw status | grep -q "80/tcp.*ALLOW"; then
-                echo ">>> Allowing port 80/tcp temporarily..."
+                echo ">>> Allowing port 80/tcp..."
                 sudo ufw allow 80/tcp
               fi
             fi
-
+          
             # --- 4. Request certificate ---
             DOMAIN="aparat.coursevideo.ir"
             EMAIL="admin@${DOMAIN}"
-
             echo "=== Requesting certificate for $DOMAIN ==="
-            CERT_RESP=$(curl -s -b /tmp/cookie.txt -X POST "${BASE_URL}/panel/api/inbounds/generateCert" \
+            CERT_RESP=$(curl -s -b "$COOKIE_TMP" -X POST "${BASE_URL}/panel/api/inbounds/generateCert" \
               -H "Content-Type: application/json" \
               -d "{\"domains\":[\"$DOMAIN\"],\"email\":\"$EMAIL\"}")
             echo "Certificate response: $CERT_RESP"
-
             CERT_FILE=$(echo "$CERT_RESP" | jq -r '.data.certFile')
             KEY_FILE=$(echo "$CERT_RESP" | jq -r '.data.keyFile')
             if [ "$CERT_FILE" = "null" ] || [ -z "$CERT_FILE" ]; then
-              echo "❌ Certificate generation failed. Ensure domain $DOMAIN points to this VPS and port 80 is open."
+              echo "❌ Certificate generation failed. Ensure domain points to this VPS and port 80 open."
               exit 1
             fi
             echo "✔ Certificate saved: cert=$CERT_FILE key=$KEY_FILE"
-
+          
             # --- 5. Choose port ---
             DESIRED_PORT=443
             if ss -tlnp | grep -q ":$DESIRED_PORT "; then
@@ -110,7 +123,7 @@ jobs:
             else
               INBOUND_PORT=$DESIRED_PORT
             fi
-
+          
             # --- 6. Create VLESS inbound ---
             CLIENT_UUID=$(cat /proc/sys/kernel/random/uuid)
             echo "=== Creating inbound on port $INBOUND_PORT ==="
@@ -121,21 +134,14 @@ jobs:
               --arg certFile "$CERT_FILE" \
               --arg keyFile "$KEY_FILE" \
               '{
-                up: 0,
-                down: 0,
-                total: 0,
-                remark: $domain,
-                enable: true,
-                expiryTime: 0,
-                listen: "",
-                port: ($port | tonumber),
-                protocol: "vless",
+                up: 0, down: 0, total: 0, remark: $domain, enable: true, expiryTime: 0,
+                listen: "", port: ($port | tonumber), protocol: "vless",
                 settings: "{\"clients\":[{\"id\":\"\($uuid)\",\"flow\":\"\"}],\"decryption\":\"none\",\"fallbacks\":[]}",
                 streamSettings: "{\"network\":\"tcp\",\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"\($domain)\",\"certificates\":[{\"certificateFile\":\"\($certFile)\",\"keyFile\":\"\($keyFile)\"}]}}",
                 sniffing: "{\"enabled\":true,\"destOverride\":[\"http\",\"tls\"]}"
               }')
-
-            ADD_RESP=$(curl -s -b /tmp/cookie.txt -X POST "${BASE_URL}/panel/api/inbounds/add" \
+          
+            ADD_RESP=$(curl -s -b "$COOKIE_TMP" -X POST "${BASE_URL}/panel/api/inbounds/add" \
               -H "Content-Type: application/json" \
               -d "$PAYLOAD")
             echo "Add inbound response: $ADD_RESP"
@@ -145,21 +151,21 @@ jobs:
               exit 1
             fi
             echo "✔ Inbound created with id=$INBOUND_ID"
-
+          
             # --- 7. Get share link ---
-            SHARE_RESP=$(curl -s -b /tmp/cookie.txt "${BASE_URL}/panel/api/inbounds/share/${INBOUND_ID}")
+            SHARE_RESP=$(curl -s -b "$COOKIE_TMP" "${BASE_URL}/panel/api/inbounds/share/${INBOUND_ID}")
             VLESS_LINK=$(echo "$SHARE_RESP" | jq -r '.data')
             if [ "$VLESS_LINK" = "null" ] || [ -z "$VLESS_LINK" ]; then
               VLESS_LINK="vless://${CLIENT_UUID}@${DOMAIN}:${INBOUND_PORT}?type=tcp&security=tls&sni=${DOMAIN}#${DOMAIN}"
             fi
-
+          
             echo ""
             echo "=========================================="
             echo "VLESS LINK:"
             echo "$VLESS_LINK"
             echo "=========================================="
-
-            rm -f /tmp/cookie.txt
+          
+            rm -f "$RESPONSE_TMP" "$COOKIE_TMP" /tmp/curl_stderr.txt
         env:
           USER_3XUI: ${{ secrets.USER_3XUI }}
           PASS_3XUI: ${{ secrets.PASS_3XUI }}
