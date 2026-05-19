@@ -1,17 +1,15 @@
 name: Enable Root Password & SSH Password Auth
 
 on:
-  workflow_dispatch:  # manual trigger only
+  push:
+    branches: [ main ]
 
 jobs:
   configure-vps:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout (optional, not required)
-        uses: actions/checkout@v4
-
       - name: Install SSH client
-        run: sudo apt-get update && sudo apt-get install -y ssh-client
+        run: sudo apt-get update && sudo apt-get install -y openssh-client
 
       - name: Set up SSH key
         run: |
@@ -19,23 +17,39 @@ jobs:
           echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
 
-      - name: Add host to known_hosts (optional, avoids prompt)
+      - name: Add host to known_hosts
         run: |
-          ssh-keyscan -p ${{ secrets.VPS_PORT }} ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts
+          ssh-keyscan -p ${{ secrets.VPS_PORT }} ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
 
-      - name: Execute commands on VPS
+      - name: Configure SSH password authentication on VPS
         run: |
-          ssh -v -p ${{ secrets.VPS_PORT }} -i ~/.ssh/id_rsa \
+          ssh -p ${{ secrets.VPS_PORT }} -i ~/.ssh/id_rsa \
+            -o StrictHostKeyChecking=accept-new \
             ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} << 'EOF'
-            # Set root password from secret
-            
+            # Set root password (from secret)
+            echo "root:${{ secrets.VPS_PASS }}" | sudo chpasswd
 
-            # Enable password authentication in SSH config
+            # Enable password authentication and root login in sshd_config
             sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
             sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
-            # Restart SSH service
-            sudo systemctl restart sshd
+            # Validate configuration before restart
+            sudo sshd -t || { echo "❌ Invalid SSH config"; exit 1; }
 
-            echo "✅ Root password set and SSH password login enabled."
+            # Restart the correct service (Ubuntu uses 'ssh', not 'sshd')
+            sudo systemctl restart ssh
+
+            # Show service status
+            sudo systemctl status ssh --no-pager
+
+            echo "✅ Root password set and SSH password login enabled"
           EOF
+
+      - name: Verify password authentication works (optional)
+        run: |
+          # Quick test using sshpass (install only for test)
+          sudo apt-get install -y sshpass
+          sshpass -p "${{ secrets.VPS_PASS }}" ssh -p ${{ secrets.VPS_PORT }} \
+            -o StrictHostKeyChecking=accept-new \
+            root@${{ secrets.VPS_HOST }} "echo 'Password login successful'" || \
+            echo "⚠️ Password login test failed – check SSH config manually"
